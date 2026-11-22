@@ -1,0 +1,23 @@
+services:
+  preview:
+    build: .
+    image: preview-batch-demo:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      TRANSCODE_SLOTS: "2"
+      SLOW_AFTER_SECONDS: "2.0"
+      SLOW_READRATE: "0.4"
+    volumes:
+      - preview-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+volumes:
+  preview-data:

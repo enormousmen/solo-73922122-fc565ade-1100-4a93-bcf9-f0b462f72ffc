@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>预览片转码批次</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>预览片转码批次</h1>
+      <p class="subtitle">三段无声短片 · 共用 <span id="slot-total">{{ slots_total }}</span> 个转码槽 · 首跑超过 {{ slow_after_seconds }} 秒自动补派</p>
+    </div>
+    <div class="slots" title="正在占用转码槽的进程数 / 总槽数">
+      <span class="slots-label">转码槽</span>
+      <span class="slots-value"><span id="slots-used">0</span> / <span id="slots-total">{{ slots_total }}</span></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel create-panel">
+      <h2>启动新批次</h2>
+      <form id="create-form">
+        <label for="slow-clip">指定模拟首跑变慢的片段</label>
+        <div class="segmented" id="slow-clip">
+          {% for name in clip_names %}
+          <label class="segmented-option">
+            <input type="radio" name="slow_clip" value="{{ name }}" {% if loop.first %}checked{% endif %}>
+            <span>片段 {{ name }}</span>
+          </label>
+          {% endfor %}
+        </div>
+        <button type="submit" id="create-button">启动转码批次</button>
+        <span id="create-status" class="create-status" role="status"></span>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>批次与尝试</h2>
+        <span class="hint">每 0.4 秒自动刷新</span>
+      </div>
+      <div id="batches" class="batches">
+        <p class="empty">还没有批次。选择一个片段变慢，然后启动。</p>
+      </div>
+    </section>
+  </main>
+
+  <template id="batch-template">
+    <article class="batch">
+      <div class="batch-head">
+        <div>
+          <h3>批次 <code class="batch-id"></code></h3>
+          <p class="batch-meta"></p>
+        </div>
+        <div class="batch-status"></div>
+      </div>
+      <div class="progress" aria-hidden="true"><div class="progress-bar"></div></div>
+      <div class="segment-grid"></div>
+      <div class="batch-footer">
+        <a class="download" hidden>下载成片 MP4</a>
+        <span class="batch-error" hidden></span>
+      </div>
+    </article>
+  </template>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
