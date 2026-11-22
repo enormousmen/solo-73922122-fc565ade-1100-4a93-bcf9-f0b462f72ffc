@@ -4,6 +4,47 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
+
+# Per-batch FFmpeg slot-second budget accepted by the creation API.
+MIN_SLOT_BUDGET_SECONDS = 1
+MAX_SLOT_BUDGET_SECONDS = 120
+
+_SLOT_BUDGET_ERROR = (
+    f"槽秒预算必须是 {MIN_SLOT_BUDGET_SECONDS}~{MAX_SLOT_BUDGET_SECONDS} "
+    "的整数，或留空"
+)
+
+
+def normalize_slot_budget(raw: Any) -> int | None:
+    """Normalize an optional slot-second budget.
+
+    ``None`` and blank strings mean "no budget" (original flow). Integers and
+    integer-valued strings/floats are accepted; booleans, fractions, and values
+    outside 1..120 are rejected.
+    """
+
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        raise ValueError(_SLOT_BUDGET_ERROR)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text == "":
+            return None
+        try:
+            value = int(text)
+        except ValueError as exc:
+            raise ValueError(_SLOT_BUDGET_ERROR) from exc
+    elif isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float) and raw.is_integer():
+        value = int(raw)
+    else:
+        raise ValueError(_SLOT_BUDGET_ERROR)
+    if not MIN_SLOT_BUDGET_SECONDS <= value <= MAX_SLOT_BUDGET_SECONDS:
+        raise ValueError(_SLOT_BUDGET_ERROR)
+    return value
 
 
 def _env_int(name: str, default: int) -> int:

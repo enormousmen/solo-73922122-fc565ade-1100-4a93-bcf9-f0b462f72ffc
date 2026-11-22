@@ -8,6 +8,8 @@
     failed: "失败",
     aborted: "已放弃",
     composing: "合成中",
+    draining: "等待槽释放",
+    exceeded: "槽秒超限",
     ready: "可下载",
   };
 
@@ -49,26 +51,39 @@
   function statusLabel(batch) {
     if (batch.status === "ready") return `可下载`;
     if (batch.status === "failed") return "无成片";
+    if (batch.status === "exceeded") return "槽秒超限";
+    if (batch.status === "draining") return "等待槽释放";
     if (batch.status === "composing") return "合成中";
     return "运行中";
+  }
+
+  function fmtSlotSeconds(value) {
+    if (value == null) return "—";
+    return (Math.round(value * 100) / 100).toFixed(2);
   }
 
   async function createBatch(event) {
     event.preventDefault();
     const chosen = form.querySelector('input[name="slow_clip"]:checked');
     if (!chosen) return;
+    const budgetInput = document.getElementById("slot-budget");
+    const rawBudget = budgetInput ? budgetInput.value.trim() : "";
     createButton.disabled = true;
     createStatus.classList.remove("error");
     createStatus.textContent = "正在启动…";
     try {
+      const payload = { slow_clip: chosen.value };
+      if (rawBudget !== "") payload.slot_budget = rawBudget;
       const res = await fetch("/api/batches", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ slow_clip: chosen.value }),
+        body: JSON.stringify(payload),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || `HTTP ${res.status}`);
-      createStatus.textContent = `已启动批次 ${body.id.slice(0, 8)}`;
+      createStatus.textContent =
+        `已启动批次 ${body.id.slice(0, 8)}` +
+        (body.slot_budget != null ? ` · 预算 ${body.slot_budget} 槽秒` : "");
       await refresh();
     } catch (err) {
       createStatus.classList.add("error");
@@ -88,6 +103,9 @@
     mid.className = "attempt-time";
     const timing = attempt.elapsed_ms == null ? "未开始" : fmtSeconds(attempt.elapsed_ms);
     mid.textContent = `${ATTEMPT_LABELS[attempt.status] || attempt.status} · ${timing} · ${fmtClock(attempt.started_at) || "—"}`;
+    if (attempt.slot_seconds > 0) {
+      mid.textContent += ` · ${fmtSlotSeconds(attempt.slot_seconds)} 槽秒`;
+    }
     const right = document.createElement("span");
     right.className = "attempt-time";
     right.textContent = attempt.slot_held ? "占槽" : "";
@@ -146,17 +164,40 @@
     return card;
   }
 
+  function renderBudgetMeter(node, batch) {
+    if (batch.slot_budget == null) return;
+    const meter = node.querySelector(".budget-meter");
+    meter.hidden = false;
+    const used = batch.slot_seconds_used || 0;
+    const budget = batch.slot_budget;
+    const ratio = budget > 0 ? used / budget : 0;
+    node.querySelector(".budget-meter-label").textContent =
+      `槽秒预算 ${budget}`;
+    node.querySelector(".budget-meter-value").textContent =
+      `${fmtSlotSeconds(used)} / ${budget} 槽秒` +
+      (batch.budget_exceeded ? " · 超限" : batch.budget_reached ? " · 已达上限" : "");
+    const fill = node.querySelector(".budget-fill");
+    fill.style.width = `${Math.min(100, ratio * 100)}%`;
+    meter.classList.toggle("is-exceeded", !!batch.budget_exceeded);
+    meter.classList.toggle("is-warning", !batch.budget_exceeded && ratio >= 0.8);
+  }
+
   function renderBatch(batch) {
     const node = template.content.firstElementChild.cloneNode(true);
     node.dataset.batchId = batch.id;
     node.querySelector(".batch-id").textContent = batch.id.slice(0, 8);
     const selectedSegments = batch.segments.filter((s) => s.status === "succeeded").length;
-    node.querySelector(".batch-meta").textContent =
+    let meta =
       `慢速片段 ${batch.slow_clip} · ${selectedSegments}/${batch.segments.length} 段已选定 · 用时 ${fmtSeconds(batch.elapsed_ms)} · 槽 ${batch.slots_used}/${batch.slots_total}`;
+    if (batch.slot_budget != null) {
+      meta += ` · 预算 ${batch.slot_budget} 槽秒 · 已用 ${fmtSlotSeconds(batch.slot_seconds_used)}`;
+    }
+    node.querySelector(".batch-meta").textContent = meta;
     const badge = node.querySelector(".batch-status");
     badge.classList.add(batch.status);
     badge.textContent = statusLabel(batch);
     node.querySelector(".progress-bar").style.width = `${(selectedSegments / batch.segments.length) * 100}%`;
+    renderBudgetMeter(node, batch);
 
     const grid = node.querySelector(".segment-grid");
     for (const segment of batch.segments) grid.append(renderSegment(segment));
@@ -165,11 +206,24 @@
     if (batch.download_ready && batch.download_url) {
       download.hidden = false;
       download.href = batch.download_url;
+    } else if (batch.status === "draining") {
+      download.hidden = false;
+      download.classList.add("download-pending");
+      download.removeAttribute("href");
+      download.textContent = "等待本批转码槽释放…";
     }
     const error = node.querySelector(".batch-error");
     if (batch.error) {
       error.hidden = false;
       error.textContent = batch.error;
+    } else if (batch.status === "draining") {
+      // The pending download control already explains the wait.
+      error.hidden = true;
+    } else if (batch.status === "exceeded" && batch.download_blocked_reason) {
+      error.hidden = false;
+      error.textContent = batch.download_blocked_reason;
+    } else {
+      error.hidden = true;
     }
     return node;
   }

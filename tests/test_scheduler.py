@@ -400,3 +400,261 @@ def test_pick_next_candidate_prioritises_unstarted_segments():
     )
     segment, kind = pick_next_candidate([batch2, batch1], settings, now)
     assert (segment.name, kind) == ("B", "first")
+
+
+# ---------------------------------------------------------------- slot budget
+
+
+def _mine(batch: dict) -> list[dict]:
+    return batch["attempts"]
+
+
+def test_slot_budget_is_optional_and_blank_keeps_original_flow(started):
+    started.write_fake_config({"sleep": 0.02})
+    manager = started.manager
+    batch = manager.create_batch("A")
+    assert batch["slot_budget"] is None
+    assert batch["slot_seconds_used"] == 0
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] == "ready"
+        else None,
+        timeout=10,
+    )
+    assert final["download_ready"] is True
+    # Usage is still reported for unbudgeted batches, and never blocks them.
+    assert final["slot_seconds_used"] > 0
+    assert final["budget_exceeded"] is False
+    assert final["download_blocked_reason"] is None
+
+
+def test_two_slots_for_one_second_meter_two_slot_seconds(started):
+    # Two segments run concurrently for ~0.5s, then the third; total metered
+    # usage should be roughly the sum over attempts, not the batch wall time.
+    started.write_fake_config({"sleep": 0.5})
+    manager = started.manager
+    batch = manager.create_batch("A", slot_budget=120)
+
+    def two_running():
+        b = started.batch(batch["id"])
+        live = [a for a in b["attempts"] if a["status"] == "running"]
+        return b if len(live) == 2 else None
+
+    seen = started.wait_for(two_running, timeout=5)
+    assert seen["slots_used"] == 2
+    # Live usage grows while both processes hold slots: ~2 slot-seconds per
+    # second of wall time while two are live.
+    before = seen["slot_seconds_used"]
+    time.sleep(0.2)
+    after = started.batch(batch["id"])["slot_seconds_used"]
+    assert after - before >= 0.3  # ~0.4 expected; generous for CI jitter
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] in ("ready", "failed", "exceeded")
+        else None,
+        timeout=10,
+    )
+    assert final["status"] == "ready"
+    per_attempt = [a["slot_seconds"] for a in final["attempts"]]
+    assert all(v > 0.3 for v in per_attempt)
+    assert abs(final["slot_seconds_used"] - sum(per_attempt)) < 0.05
+
+
+def test_budget_exhausted_cancels_live_attempts_and_blocks_download(started):
+    started.write_fake_config({"sleep": 5.0})
+    manager = started.manager
+    batch = manager.create_batch("A", slot_budget=1)
+
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] == "exceeded"
+        else None,
+        timeout=6,
+    )
+    assert final["budget_exceeded"] is True
+    assert final["download_ready"] is False
+    assert final["download_url"] is None
+    assert "预算" in final["error"]
+    assert manager.get_batch_file(batch["id"]) is None
+    # Live attempts were asked to stop.
+    assert all(
+        a["status"] in ("cancelling", "cancelled", "failed") for a in final["attempts"]
+    )
+    assert any(a["cancel_reason"] == "批次槽秒预算已用尽" for a in final["attempts"])
+
+    # Cancelled processes keep metering until they exit, then release.
+    drained = started.wait_for(
+        lambda: (lambda b: b if not any(a["slot_held"] for a in b["attempts"]) else None)(
+            started.batch(batch["id"])
+        ),
+        timeout=10,
+    )
+    assert drained["status"] == "exceeded"
+    assert drained["slot_seconds_used"] >= 1
+    assert manager.slots_used == 0
+    # No composed file was ever offered.
+    assert manager.get_batch_file(batch["id"]) is None
+
+
+def test_budgeted_batch_waits_for_all_slots_before_download(started):
+    # A's slow first run ignores cancellation long enough that composition is
+    # done before the cancelled process exits. With a generous budget the
+    # batch must stay "draining" (no download) until the slot is free.
+    started.write_fake_config(
+        {
+            "sleep": 0.02,
+            "segments": {"A": {"slow": {"sleep": 1.2, "ignore_term": 0.4}}},
+        }
+    )
+    manager = started.manager
+    batch = manager.create_batch("A", slot_budget=60)
+
+    draining = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] == "draining"
+        else None,
+        timeout=6,
+    )
+    assert any(a["slot_held"] for a in draining["attempts"])
+    assert draining["download_ready"] is False
+    assert "槽" in draining["download_blocked_reason"]
+    assert manager.get_batch_file(batch["id"]) is None
+
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] in ("ready", "exceeded")
+        else None,
+        timeout=10,
+    )
+    assert final["status"] == "ready"
+    assert final["slot_seconds_used"] < final["slot_budget"]
+    assert not any(a["slot_held"] for a in final["attempts"])
+    assert final["download_ready"] is True
+    assert manager.get_batch_file(batch["id"]) is not None
+
+
+def test_overshoot_before_drain_withholds_composed_file(started):
+    # Budget 1 slot-second; a fast attempt already uses ~0.5s and a slow one
+    # pushes past the budget. The composed file might exist on disk but the
+    # final gate must refuse it because confirmed usage exceeded the budget.
+    started.write_fake_config(
+        {
+            "sleep": 0.3,
+            "segments": {"A": {"slow": {"sleep": 1.4, "ignore_term": 0.2}}},
+        }
+    )
+    manager = started.manager
+    batch = manager.create_batch("A", slot_budget=1)
+    final = started.wait_for(
+        lambda: started.batch(batch["id"])
+        if started.batch(batch["id"])["status"] in ("ready", "failed", "exceeded")
+        else None,
+        timeout=10,
+    )
+    assert final["status"] == "exceeded"
+    assert final["download_ready"] is False
+    assert manager.get_batch_file(batch["id"]) is None
+
+
+def test_budget_does_not_dispatch_new_work_after_reaching_limit(started):
+    # Two batches, the budgeted one fills its budget; the other keeps going.
+    started.write_fake_config({"sleep": 0.4})
+    manager = started.manager
+    budgeted = manager.create_batch("A", slot_budget=1)
+    unbudgeted = manager.create_batch("B", slot_budget=None)
+
+    final = started.wait_for(
+        lambda: started.batch(budgeted["id"])
+        if started.batch(budgeted["id"])["status"] == "exceeded"
+        else None,
+        timeout=8,
+    )
+    # No queued attempt in the budgeted batch may remain after the stop.
+    assert not any(a["status"] == "queued" for a in final["attempts"])
+    # The unbudgeted batch still gets to finish.
+    other = started.wait_for(
+        lambda: started.batch(unbudgeted["id"])
+        if started.batch(unbudgeted["id"])["status"] == "ready"
+        else None,
+        timeout=15,
+    )
+    assert other["download_ready"] is True
+
+
+def test_pick_next_candidate_skips_budget_reached_batches():
+    from app.scheduler import Batch, Segment
+
+    settings = type("S", (), {"slow_after_seconds": 2.0})()
+    batch = Batch(
+        id="b1",
+        slow_clip="A",
+        clip_names=("A", "B", "C"),
+        work_dir=Path("/tmp"),
+        slot_budget=1,
+    )
+    for index, name in enumerate(("A", "B", "C")):
+        batch.segments[name] = Segment(name=name, index=index, slow_first=(name == "A"))
+    # Charge the budget via a finished attempt.
+    from app.scheduler import Attempt
+
+    done = Attempt(id="x", segment="A", kind="first", status="succeeded")
+    done.slot_seconds = 1.0
+    done.slot_held = False
+    batch.segments["A"].attempts.append(done)
+
+    assert pick_next_candidate([batch], settings, 100.0) is None
+    # With the budget removed the never-started segments are dispatchable again.
+    batch.slot_budget = None
+    from app.scheduler import Attempt as _Attempt
+
+    queued = _Attempt(id="q", segment="B", kind="first", status="queued")
+    batch.segments["B"].attempts.append(queued)
+    chosen = pick_next_candidate([batch], settings, 100.0)
+    assert chosen is not None and chosen[0].name == "B"
+
+
+def test_usage_equal_to_budget_is_exceeded_and_never_downloadable():
+    from app.scheduler import Attempt, Batch, Segment
+
+    batch = Batch(
+        id="b1",
+        slow_clip="A",
+        clip_names=("A", "B", "C"),
+        work_dir=Path("/tmp"),
+        slot_budget=5,
+    )
+    seg = Segment(name="A", index=0, slow_first=True)
+    done = Attempt(id="x", segment="A", kind="first", status="succeeded")
+    done.slot_seconds = 4.999
+    seg.attempts.append(done)
+    batch.segments["A"] = seg
+    # Just below the budget: not reached.
+    assert batch.budget_reached(100.0) is False
+    # Exactly at the budget counts as reached ("用量达到预算").
+    done.slot_seconds = 5.0
+    assert batch.budget_reached(100.0) is True
+    # "Ready" alone is not enough for a budgeted batch at the limit.
+    batch.status = "ready"
+    batch.final_path = Path("/tmp/does-not-matter.mp4")
+    batch.final_path.write_bytes(b"x")
+    try:
+        assert batch.can_download(100.0) is False
+    finally:
+        batch.final_path.unlink(missing_ok=True)
+
+
+def test_live_metering_extends_open_hold_segment():
+    from app.scheduler import Attempt
+
+    a = Attempt(id="1", segment="A", kind="first", status="running")
+    a.started_at = 100.0
+    a.slot_held = True
+    a.slot_meter_started_at = 100.0
+    assert a.slot_seconds_live(101.5) == 1.5
+    # Finishing settles the open segment exactly once.
+    a.slot_seconds += 101.5 - a.slot_meter_started_at
+    a.slot_meter_started_at = None
+    a.slot_held = False
+    a.finished_at = 101.5
+    assert a.slot_seconds_live(102.0) == 1.5
+    assert a.to_dict(102.0)["slot_seconds"] == 1.5

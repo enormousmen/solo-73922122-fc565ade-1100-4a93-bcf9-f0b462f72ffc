@@ -99,6 +99,21 @@ button:disabled { opacity: .55; cursor: wait; }
 .create-status { color: var(--muted); font-size: .85rem; }
 .create-status.error { color: var(--bad); }
 
+.budget-field { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.budget-field label { color: var(--muted); font-size: .85rem; }
+.budget-field input {
+  width: 130px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 9px;
+  padding: 9px 12px;
+  font-size: .9rem;
+  font-variant-numeric: tabular-nums;
+}
+.budget-field input:focus { outline: 2px solid rgba(90, 169, 255, .5); outline-offset: 1px; }
+.budget-hint { color: var(--muted); font-size: .75rem; flex-basis: 100%; }
+
 .panel-head { display: flex; justify-content: space-between; align-items: baseline; }
 .hint { color: var(--muted); font-size: .8rem; }
 .empty { color: var(--muted); }
@@ -116,6 +131,18 @@ button:disabled { opacity: .55; cursor: wait; }
 .batch-status.composing { color: var(--warn); border-color: rgba(242, 184, 75, .4); }
 .batch-status.ready { color: var(--good); border-color: rgba(61, 204, 140, .4); }
 .batch-status.failed { color: var(--bad); border-color: rgba(255, 107, 107, .4); }
+.batch-status.exceeded { color: var(--bad); border-color: rgba(255, 107, 107, .65); background: rgba(255, 107, 107, .08); }
+.batch-status.draining { color: var(--warn); border-color: rgba(242, 184, 75, .4); }
+
+.budget-meter { margin: -4px 0 14px; }
+.budget-meter-head { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 5px; }
+.budget-meter-label { color: var(--muted); font-size: .75rem; }
+.budget-meter-value { font-size: .78rem; font-variant-numeric: tabular-nums; color: var(--text); }
+.budget-track { height: 6px; border-radius: 6px; background: #0d1117; overflow: hidden; }
+.budget-fill { height: 100%; width: 0; border-radius: 6px; background: var(--accent); transition: width .2s; }
+.budget-meter.is-warning .budget-fill { background: var(--warn); }
+.budget-meter.is-exceeded .budget-fill { background: var(--bad); }
+.budget-meter.is-exceeded .budget-meter-value { color: var(--bad); font-weight: 600; }
 
 .progress { height: 4px; border-radius: 4px; background: #0d1117; margin: 14px 0; overflow: hidden; }
 .progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--good)); transition: width .25s; }
@@ -165,4 +192,12 @@ button:disabled { opacity: .55; cursor: wait; }
   border-radius: 10px;
 }
 .download:hover { filter: brightness(1.08); }
+.download.download-pending {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px dashed var(--border);
+  cursor: default;
+  pointer-events: none;
+  font-weight: 500;
+}
 .batch-error { color: var(--bad); font-size: .82rem; }

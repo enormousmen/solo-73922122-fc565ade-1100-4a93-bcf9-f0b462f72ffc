@@ -114,3 +114,68 @@ def test_failed_batch_has_no_download(client):
     assert final["download_ready"] is False
     response = client.get(f"/batches/{created['id']}/download")
     assert response.status_code == 409
+
+
+# ---------------------------------------------------------------- slot budget
+
+
+@pytest.mark.parametrize("bad", [0, 121, -1, 2.5, "abc", True, [2]])
+def test_budget_validation_rejects_out_of_range(client, bad):
+    response = client.post("/api/batches", json={"slow_clip": "A", "slot_budget": bad})
+    assert response.status_code == 400
+    assert "slot_budget" in response.json()["detail"] or "槽秒" in response.json()["detail"]
+
+
+@pytest.mark.parametrize("blank", [None, "", "  "])
+def test_blank_budget_keeps_original_flow(client, blank):
+    payload = {"slow_clip": "A"}
+    if blank is not None:
+        payload["slot_budget"] = blank
+    created = client.post("/api/batches", json=payload)
+    assert created.status_code == 201
+    batch = created.json()
+    assert batch["slot_budget"] is None
+    final = wait_ready(client, batch["id"])
+    assert final["status"] == "ready"
+    assert final["download_ready"] is True
+    assert client.get(f"/batches/{batch['id']}/download").status_code == 200
+
+
+@pytest.mark.parametrize("good,expected", [(1, 1), ("120", 120), (60, 60), (" 7 ", 7)])
+def test_integer_budget_is_accepted(client, good, expected):
+    created = client.post(
+        "/api/batches", json={"slow_clip": "A", "slot_budget": good}
+    )
+    assert created.status_code == 201
+    assert created.json()["slot_budget"] == expected
+
+
+def test_budgeted_batch_over_limit_has_no_download(client):
+    FAKE_CONFIG.write_text(json.dumps({"sleep": 2.0}), encoding="utf-8")
+    created = client.post(
+        "/api/batches", json={"slow_clip": "A", "slot_budget": 1}
+    ).json()
+    assert created["slot_budget"] == 1
+    deadline = time.monotonic() + 12
+    final = None
+    while time.monotonic() < deadline:
+        body = client.get(f"/api/batches/{created['id']}").json()
+        if body["status"] in ("ready", "failed", "exceeded"):
+            final = body
+            break
+        time.sleep(0.03)
+    assert final is not None and final["status"] == "exceeded"
+    assert final["budget_exceeded"] is True
+    assert final["download_ready"] is False
+    assert final["download_url"] is None
+    response = client.get(f"/batches/{created['id']}/download")
+    assert response.status_code == 409
+    assert "预算" in response.json()["detail"]
+    # The card carries cumulative usage.
+    assert final["slot_seconds_used"] >= 1
+
+
+def test_config_exposes_budget_range(client):
+    config = client.get("/api/config").json()
+    assert config["min_slot_budget"] == 1
+    assert config["max_slot_budget"] == 120

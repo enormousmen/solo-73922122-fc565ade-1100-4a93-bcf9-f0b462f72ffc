@@ -12,7 +12,14 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from . import media
-from .config import BASE_DIR, Settings, settings as default_settings
+from .config import (
+    BASE_DIR,
+    MAX_SLOT_BUDGET_SECONDS,
+    MIN_SLOT_BUDGET_SECONDS,
+    Settings,
+    normalize_slot_budget,
+    settings as default_settings,
+)
 from .scheduler import BatchManager
 
 logger = logging.getLogger("preview")
@@ -55,6 +62,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 "clip_names": list(settings.clip_names),
                 "slots_total": mgr.slots_total,
                 "slow_after_seconds": settings.slow_after_seconds,
+                "min_slot_budget": MIN_SLOT_BUDGET_SECONDS,
+                "max_slot_budget": MAX_SLOT_BUDGET_SECONDS,
                 "batches": mgr.list_batches(),
             },
         )
@@ -68,6 +77,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "slots_used": mgr.slots_used,
             "slow_after_seconds": settings.slow_after_seconds,
             "poll_interval_ms": 400,
+            "min_slot_budget": MIN_SLOT_BUDGET_SECONDS,
+            "max_slot_budget": MAX_SLOT_BUDGET_SECONDS,
         }
 
     @app.get("/api/batches")
@@ -94,7 +105,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 detail=f"slow_clip 必须是 {', '.join(settings.clip_names)} 之一",
             )
         try:
-            return mgr.create_batch(slow_clip)
+            slot_budget = normalize_slot_budget(payload.get("slot_budget"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            return mgr.create_batch(slow_clip, slot_budget=slot_budget)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -113,7 +128,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if batch is None:
             raise HTTPException(status_code=404, detail="批次不存在")
         if path is None:
-            detail = batch.get("error") or "成片尚未就绪"
+            detail = batch.get("download_blocked_reason") or "成片尚未就绪"
             return JSONResponse(status_code=409, content={"detail": detail})
         return FileResponse(
             path,

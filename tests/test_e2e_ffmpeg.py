@@ -100,3 +100,74 @@ def test_real_ffmpeg_slow_a_produces_ordered_cut(tmp_path: Path):
         assert data["slots_used"] == 0
     finally:
         manager.shutdown()
+
+
+def _make_settings(tmp_path: Path) -> Settings:
+    settings = Settings()
+    settings.data_dir = tmp_path / "data"
+    settings.ffmpeg_binary = FFMPEG
+    settings.slots = 2
+    settings.slow_after_seconds = 0.5
+    settings.monitor_interval = 0.05
+    settings.cancel_grace_seconds = 2.0
+    settings.clip_seconds = 2
+    settings.slow_readrate = 0.25  # ~8s for a 2s clip
+    for sub in ("inputs", "work", "outputs"):
+        (settings.data_dir / sub).mkdir(parents=True, exist_ok=True)
+    media.ensure_fixtures(settings)
+    return settings
+
+
+def _settle(manager, batch_id: str, timeout: float = 40) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        data = manager.get_batch(batch_id)
+        if data["status"] in ("ready", "failed", "exceeded"):
+            return data
+        time.sleep(0.05)
+    raise AssertionError("batch did not settle")
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="real ffmpeg not available")
+def test_real_ffmpeg_budget_exceeded_stops_and_withholds(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    manager = BatchManager(settings)
+    try:
+        batch = manager.create_batch("A", slot_budget=1)
+        final = _settle(manager, batch["id"])
+        assert final["status"] == "exceeded", final["error"]
+        assert final["budget_exceeded"] is True
+        assert final["download_ready"] is False
+        assert manager.get_batch_file(batch["id"]) is None
+        assert final["slot_seconds_used"] >= 1
+        # Wait for every cancelled process so the global pool is clean.
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            data = manager.get_batch(batch["id"])
+            if not any(a["slot_held"] for a in data["attempts"]):
+                break
+            time.sleep(0.05)
+        assert manager.slots_used == 0
+        assert data["status"] == "exceeded"
+    finally:
+        manager.shutdown()
+
+
+@pytest.mark.skipif(FFMPEG is None, reason="real ffmpeg not available")
+def test_real_ffmpeg_generous_budget_is_metered_and_downloadable(tmp_path: Path):
+    settings = _make_settings(tmp_path)
+    manager = BatchManager(settings)
+    try:
+        batch = manager.create_batch("A", slot_budget=60)
+        final = _settle(manager, batch["id"])
+        assert final["status"] == "ready", final["error"]
+        assert final["download_ready"] is True
+        assert final["slot_seconds_used"] > 0
+        assert final["slot_seconds_used"] < 60
+        path = manager.get_batch_file(batch["id"])
+        assert path is not None and path.is_file()
+        duration = media.probe_duration(FFMPEG, path)
+        assert duration is not None and 5.5 <= duration <= 7.0, duration
+        assert not any(a["slot_held"] for a in final["attempts"])
+    finally:
+        manager.shutdown()

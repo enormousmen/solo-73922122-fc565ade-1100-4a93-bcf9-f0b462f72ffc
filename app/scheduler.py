@@ -16,6 +16,14 @@ Design notes
 * Once all three segments have a selection, composition starts immediately in
   a separate thread. It only reads the immutable selected artifacts, so it is
   allowed to run while cancelled processes are still exiting.
+* A batch may carry an optional slot-second budget. Usage is wall-clock time
+  during which one of the batch's ffmpeg processes holds a slot, summed over
+  all of its attempts: two slots held for one second meter 2 slot-seconds.
+  Backups and processes still exiting after a cancel keep metering; queued
+  attempts and composition do not. Reaching the budget stops further dispatch
+  for that batch and cancels its live attempts. A budgeted batch only becomes
+  downloadable after every attempt of that batch has released its slot *and*
+  the final usage is below the budget.
 """
 
 from __future__ import annotations
@@ -30,12 +38,16 @@ from pathlib import Path
 from typing import Any
 
 from . import media
-from .config import Settings
+from .config import MAX_SLOT_BUDGET_SECONDS, MIN_SLOT_BUDGET_SECONDS, Settings
 
 TERMINAL_ATTEMPT_STATUSES = frozenset(
     {"succeeded", "failed", "cancelled", "superseded", "skipped"}
 )
 LIVE_ATTEMPT_STATUSES = frozenset({"queued", "running", "cancelling"})
+
+
+# Tolerance for float accumulation when comparing metered usage to the budget.
+SLOT_SECONDS_EPSILON = 1e-6
 
 
 def pick_next_candidate(
@@ -49,9 +61,15 @@ def pick_next_candidate(
 
     Priority: every never-started segment of every running batch outranks all
     backups, so a later batch is not starved by an earlier batch's retry.
+
+    Batches that already reached their slot-second budget are never candidates;
+    they are cancelled by the scheduler instead of being dispatched further.
     """
 
-    ordered = sorted(batches, key=lambda b: b.created_at)
+    ordered = sorted(
+        (b for b in batches if not b.budget_reached(now)),
+        key=lambda b: b.created_at,
+    )
 
     for batch in ordered:
         if batch.status != "running":
@@ -111,6 +129,12 @@ class Attempt:
     error: str | None = None
     cancel_reason: str | None = None
     slot_held: bool = False
+    # Wall-clock seconds during which this attempt's live ffmpeg process held
+    # a slot. Finalized on exit; while live it is a settled baseline that
+    # ``slot_seconds_live`` extends with the current hold segment.
+    slot_seconds: float = 0.0
+    # Start of the not-yet-settled hold segment, if the process is live.
+    slot_meter_started_at: float | None = None
     proc: Any = field(default=None, repr=False)
     log_file: Any = field(default=None, repr=False)
 
@@ -119,6 +143,15 @@ class Attempt:
             return None
         end = self.finished_at if self.finished_at is not None else (now or time.time())
         return max(0, int((end - self.started_at) * 1000))
+
+    def slot_seconds_live(self, now: float | None = None) -> float:
+        """Metered slot-seconds including the currently open hold segment."""
+
+        total = self.slot_seconds
+        if self.slot_held and self.slot_meter_started_at is not None:
+            end = self.finished_at if self.finished_at is not None else (now or time.time())
+            total += max(0.0, end - self.slot_meter_started_at)
+        return total
 
     def to_dict(self, now: float | None = None) -> dict[str, Any]:
         return {
@@ -130,6 +163,7 @@ class Attempt:
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
             "elapsed_ms": self.elapsed_ms(now),
+            "slot_seconds": round(self.slot_seconds_live(now), 3),
             "exit_code": self.exit_code,
             "error": self.error,
             "cancel_reason": self.cancel_reason,
@@ -194,9 +228,15 @@ class Batch:
     slow_clip: str
     clip_names: tuple[str, ...]
     work_dir: Path
+    slot_budget: int | None = None
     created_at: float = field(default_factory=time.time)
-    status: str = "running"  # running/composing/ready/failed
+    # running -> composing -> draining/ready, or exceeded/failed at any point.
+    status: str = "running"
     segments: dict[str, Segment] = field(default_factory=dict)
+    # Set when the composed file has been written; for budgeted batches this
+    # may happen while cancelled attempts still hold slots ("draining").
+    compose_done: bool = False
+    budget_exceeded: bool = False
     compose_started_at: float | None = None
     finished_at: float | None = None
     final_path: Path | None = None
@@ -204,6 +244,66 @@ class Batch:
 
     def attempts(self) -> list[Attempt]:
         return [a for seg in self.segments.values() for a in seg.attempts]
+
+    def slot_seconds_used(self, now: float | None = None) -> float:
+        """Total metered usage: sum of every attempt's slot-held time."""
+
+        return sum(a.slot_seconds_live(now) for a in self.attempts())
+
+    def live_slot_attempts(self) -> list[Attempt]:
+        """Attempts whose ffmpeg process still occupies a slot."""
+
+        return [a for a in self.attempts() if a.slot_held]
+
+    def budget_reached(self, now: float | None = None) -> bool:
+        if self.slot_budget is None:
+            return False
+        if self.budget_exceeded:
+            return True
+        return self.slot_seconds_used(now) >= self.slot_budget - SLOT_SECONDS_EPSILON
+
+    def budget_exceeded_message(self, now: float | None = None) -> str:
+        used = self.slot_seconds_used(now)
+        return (
+            f"槽秒预算 {self.slot_budget} 已用尽（累计 "
+            f"{used:.2f} 槽秒），已停止派工并取消仍在运行的尝试，不提供成片"
+        )
+
+    def can_download(self, now: float | None = None) -> bool:
+        """True when the composed file may be served.
+
+        Budgeted batches additionally require every slot released and the
+        confirmed total usage strictly below the budget.
+        """
+
+        if self.status != "ready" or self.final_path is None:
+            return False
+        if not self.final_path.is_file():
+            return False
+        if self.slot_budget is not None:
+            if self.live_slot_attempts():
+                return False
+            if self.slot_seconds_used(now) >= self.slot_budget - SLOT_SECONDS_EPSILON:
+                return False
+        return True
+
+    def download_blocked_reason(self, now: float | None = None) -> str | None:
+        if self.can_download(now):
+            return None
+        if self.budget_exceeded:
+            # Metering keeps running while cancelled processes exit, so report
+            # the live total rather than the frozen snapshot.
+            return self.budget_exceeded_message(now)
+        if self.slot_budget is not None:
+            if self.live_slot_attempts():
+                return "等待本批转码槽全部释放后开放下载"
+            if self.slot_seconds_used(now) >= self.slot_budget - SLOT_SECONDS_EPSILON:
+                return self.budget_exceeded_message(now)
+        if self.status == "draining":
+            return "等待本批转码槽全部释放后开放下载"
+        if self.status == "composing":
+            return "成片合成中"
+        return self.error or "成片尚未就绪"
 
     def to_dict(
         self,
@@ -213,6 +313,12 @@ class Batch:
         slow_after_seconds: float = 2.0,
     ) -> dict[str, Any]:
         now = now or time.time()
+        used = self.slot_seconds_used(now)
+        error = self.error
+        if self.budget_exceeded:
+            # Usage keeps growing while cancelled processes exit, so the card
+            # must show the live total rather than the snapshot at the stop.
+            error = self.budget_exceeded_message(now)
         return {
             "id": self.id,
             "slow_clip": self.slow_clip,
@@ -220,17 +326,22 @@ class Batch:
             "created_at": _iso(self.created_at),
             "finished_at": _iso(self.finished_at),
             "elapsed_ms": max(0, int(((self.finished_at or now) - self.created_at) * 1000)),
-            "error": self.error,
+            "error": error,
             "slots_used": slots_used,
             "slots_total": slots_total,
+            "slot_budget": self.slot_budget,
+            "slot_seconds_used": round(used, 3),
+            "budget_exceeded": self.budget_exceeded,
+            "budget_reached": self.budget_reached(now),
             "slow_after_seconds": slow_after_seconds,
             "segments": [
                 self.segments[name].to_dict(now, slow_after_seconds)
                 for name in self.clip_names
             ],
             "attempts": [a.to_dict(now) for a in self.attempts()],
-            "download_ready": self.status == "ready" and self.final_path is not None,
+            "download_ready": self.can_download(now),
             "download_url": f"/batches/{self.id}/download" if self.status == "ready" else None,
+            "download_blocked_reason": self.download_blocked_reason(now),
         }
 
 
@@ -263,10 +374,21 @@ class BatchManager:
         with self._lock:
             return self._slots_used
 
-    def create_batch(self, slow_clip: str) -> dict[str, Any]:
+    def create_batch(
+        self, slow_clip: str, slot_budget: int | None = None
+    ) -> dict[str, Any]:
         slow_clip = (slow_clip or "").strip().upper()
         if slow_clip not in self.settings.clip_names:
             raise ValueError("slow_clip must be one of the built-in clips")
+        if slot_budget is not None and (
+            isinstance(slot_budget, bool)
+            or not isinstance(slot_budget, int)
+            or not MIN_SLOT_BUDGET_SECONDS <= slot_budget <= MAX_SLOT_BUDGET_SECONDS
+        ):
+            raise ValueError(
+                f"slot_budget 必须是 {MIN_SLOT_BUDGET_SECONDS}~"
+                f"{MAX_SLOT_BUDGET_SECONDS} 的整数"
+            )
         batch_id = uuid.uuid4().hex
         work_dir = self.settings.work_dir / batch_id
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -276,6 +398,7 @@ class BatchManager:
                 slow_clip=slow_clip,
                 clip_names=tuple(self.settings.clip_names),
                 work_dir=work_dir,
+                slot_budget=slot_budget,
             )
             for index, name in enumerate(self.settings.clip_names):
                 segment = Segment(
@@ -329,6 +452,13 @@ class BatchManager:
                 or not batch.final_path.is_file()
             ):
                 return None
+            # A budgeted batch is downloadable only after all of its slots are
+            # released and the confirmed usage is below the budget.
+            if batch.slot_budget is not None:
+                if batch.live_slot_attempts():
+                    return None
+                if batch.slot_seconds_used() >= batch.slot_budget - SLOT_SECONDS_EPSILON:
+                    return None
             return batch.final_path
 
     def shutdown(self) -> None:
@@ -361,16 +491,88 @@ class BatchManager:
                 try:
                     now = time.time()
                     self._reap(now)
+                    self._enforce_budgets(now)
+                    self._settle_batches(now)
                     self._dispatch()
                     self._reap(now)
+                    self._enforce_budgets(now)
+                    self._settle_batches(now)
                 except Exception as exc:  # keep the scheduler alive; surface via batches
                     self._record_internal_error(exc)
                 self._cond.wait(timeout=self.settings.monitor_interval)
 
+    # -- slot-second budget ------------------------------------------------
+
+    def _enforce_budgets(self, now: float) -> None:
+        """Stop a batch at its budget: cancel live attempts, skip queued ones.
+
+        Usage is metered continuously, so the check must run independently of
+        process exits; this is called both before and after ``_dispatch``.
+        Attempts in ``cancelling`` keep metering until their process exits.
+        """
+
+        for batch in self._batches.values():
+            if batch.slot_budget is None or batch.budget_exceeded:
+                continue
+            if batch.status in ("ready", "failed"):
+                continue
+            if not batch.budget_reached(now):
+                continue
+            batch.budget_exceeded = True
+            batch.status = "exceeded"
+            batch.finished_at = now
+            batch.error = batch.budget_exceeded_message(now)
+            for segment in batch.segments.values():
+                for attempt in segment.attempts:
+                    if attempt.status in ("running", "cancelling"):
+                        self._request_cancel(attempt, "批次槽秒预算已用尽")
+                    elif attempt.status == "queued":
+                        attempt.status = "cancelled"
+                        attempt.finished_at = now
+                        attempt.error = "批次槽秒预算已用尽"
+                self._refresh_segment(segment)
+
+    def _settle_batches(self, now: float) -> None:
+        """Finish a budgeted batch once every slot is released below budget.
+
+        Composition may already be done ("draining"): what is still missing is
+        confirmation that cancelled attempts have exited and that the final
+        usage did not overshoot the budget. An overshoot turns the batch into
+        ``exceeded`` so the composed file is never offered.
+        """
+
+        for batch in self._batches.values():
+            if batch.slot_budget is None:
+                continue
+            if batch.status not in ("draining", "composing"):
+                continue
+            if batch.live_slot_attempts():
+                continue
+            used = batch.slot_seconds_used(now)
+            if used >= batch.slot_budget - SLOT_SECONDS_EPSILON:
+                # Final usage is not below budget: withhold the composed file.
+                batch.budget_exceeded = True
+                batch.status = "exceeded"
+                if not batch.error:
+                    batch.error = batch.budget_exceeded_message(now)
+                if batch.finished_at is None:
+                    batch.finished_at = now
+                continue
+            if batch.status == "draining":
+                if batch.compose_done and batch.final_path is not None:
+                    batch.status = "ready"
+                    batch.error = None
+                    batch.finished_at = now
+                else:
+                    # Composed file vanished or composition never completed.
+                    batch.status = "failed"
+                    batch.error = batch.error or "成片文件缺失"
+                    batch.finished_at = now
+
     def _record_internal_error(self, exc: Exception) -> None:
         message = f"调度器内部错误: {exc!r}"
         for batch in self._batches.values():
-            if batch.status in ("running", "composing"):
+            if batch.status in ("running", "composing", "draining"):
                 batch.status = "failed"
                 batch.error = message
                 batch.finished_at = time.time()
@@ -434,6 +636,7 @@ class BatchManager:
             )
             attempt.status = "running"
             attempt.slot_held = True
+            attempt.slot_meter_started_at = attempt.started_at
             self._slots_used += 1
         except OSError as exc:
             attempt.status = "failed"
@@ -513,6 +716,9 @@ class BatchManager:
             attempt.log_file = None
         if attempt.slot_held:
             attempt.slot_held = False
+            if attempt.slot_meter_started_at is not None:
+                attempt.slot_seconds += max(0.0, now - attempt.slot_meter_started_at)
+                attempt.slot_meter_started_at = None
             self._slots_used = max(0, self._slots_used - 1)
 
         segment = batch.segments[attempt.segment]
@@ -541,6 +747,14 @@ class BatchManager:
             attempt.status = "cancelled" if cancellable_done else "failed"
             if not cancellable_done:
                 attempt.error = self._failure_detail(attempt, returncode)
+            if attempt.artifact_path is not None:
+                attempt.artifact_path.unlink(missing_ok=True)
+        elif batch.budget_exceeded:
+            # The batch was stopped at its budget; keep the reported reason
+            # ("budget exhausted") instead of relabelling a late success.
+            attempt.status = "cancelled"
+            if not cancellable_done:
+                attempt.error = "批次槽秒预算已用尽"
             if attempt.artifact_path is not None:
                 attempt.artifact_path.unlink(missing_ok=True)
         elif artifact_ok:
@@ -612,7 +826,7 @@ class BatchManager:
             segment.status = "succeeded"
             return
         batch = self._batch_for(segment)
-        if batch.status == "failed":
+        if batch.status in ("failed", "exceeded"):
             segment.status = "failed" if segment.status == "failed" else "aborted"
             return
         if any(a.status in ("running", "cancelling") for a in segment.attempts):
@@ -623,7 +837,7 @@ class BatchManager:
             segment.status = "failed"
 
     def _evaluate_batch(self, batch: Batch, now: float) -> None:
-        if batch.status in ("ready", "failed"):
+        if batch.status in ("ready", "failed", "exceeded"):
             return
 
         failed_segment = next(
@@ -698,7 +912,16 @@ class BatchManager:
             return
         with self._cond:
             if batch.status == "composing":
-                batch.status = "ready"
+                batch.compose_done = True
                 batch.final_path = target
-                batch.finished_at = time.time()
+                if batch.slot_budget is not None:
+                    # Budgeted batches must pass the final gate: every ffmpeg
+                    # slot of this batch released *and* confirmed usage below
+                    # budget. ``_settle_batches`` makes that decision, which
+                    # also avoids a race where ``ready`` is set without the
+                    # usage check.
+                    batch.status = "draining"
+                else:
+                    batch.status = "ready"
+                    batch.finished_at = time.time()
             self._cond.notify_all()
